@@ -16,8 +16,8 @@ def sec_to_hhmmss(sec: float) -> str:
     sec = max(0.0, float(sec))
     h = int(sec // 3600)
     m = int((sec % 3600) // 60)
-    s = int(sec % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+    s_ = int(sec % 60)
+    return f"{h:02d}:{m:02d}:{s_:02d}"
 
 
 def run_ffmpeg_extract_audio(video_path: str, wav_path: str):
@@ -75,7 +75,7 @@ def load_srt_items(srt_path: str):
 
 
 def normalize_text(s: str) -> str:
-    s = s.lower().strip()
+    s = (s or "").lower().strip()
     s = re.sub(r"\s+", " ", s)
     return s
 
@@ -91,6 +91,9 @@ class VideoSearchApp(tk.Tk):
         self.audio_path = ""
         self.srt_path = ""
         self.srt_items = []  # (start_sec, end_sec, text)
+
+        # ✅ Play bosilganda shu sekunddan davom etishi uchun
+        self.last_seek_sec = None  # float | None
 
         # VLC player
         self.instance = vlc.Instance()
@@ -144,10 +147,7 @@ class VideoSearchApp(tk.Tk):
         self.btn_stop = ttk.Button(controls, text="Stop", command=self.stop_video)
         self.btn_stop.pack(side=tk.LEFT, padx=4)
 
-        ttk.Label(controls, text="Sekund:").pack(side=tk.LEFT, padx=(20, 5))
-        self.seek_entry = ttk.Entry(controls, width=10)
-        self.seek_entry.pack(side=tk.LEFT)
-        ttk.Button(controls, text="Go", command=self.seek_manual).pack(side=tk.LEFT, padx=4)
+        # ✅ “Sekund:” + entry + Go olib tashlandi (siz so‘ragansiz)
 
         # O‘ng: qidiruv + natijalar + segmentlar
         right = ttk.Frame(mid)
@@ -192,7 +192,6 @@ class VideoSearchApp(tk.Tk):
         # VLC panelni playerga ulash
         self.update_idletasks()
         handle = self.video_panel.winfo_id()
-        # Windows
         self.player.set_hwnd(handle)
 
     # ---------- video ----------
@@ -210,6 +209,9 @@ class VideoSearchApp(tk.Tk):
         media = self.instance.media_new(self.video_path)
         self.player.set_media(media)
 
+        # video yangilanganda eski seek bekor bo‘lsin
+        self.last_seek_sec = None
+
         self.progress.config(text=f"Holat: video yuklandi -> {os.path.basename(path)}")
         self._try_load_existing_srt()
 
@@ -217,7 +219,22 @@ class VideoSearchApp(tk.Tk):
         if not self.video_path:
             messagebox.showwarning("Xabar", "Avval video yuklang.")
             return
+
         self.player.play()
+
+        # ✅ Agar qidiruvdan natija tanlangan bo‘lsa, Play bosilganda o‘sha joyga avtomatik sakraydi
+        if self.last_seek_sec is not None:
+            sec = float(self.last_seek_sec)
+            ms = int(max(0.0, sec) * 1000)
+
+            # VLC biroz yuklanishi uchun kichik kechikish bilan set_time
+            def _jump():
+                try:
+                    self.player.set_time(ms)
+                except Exception:
+                    pass
+
+            self.after(120, _jump)
 
     def pause_video(self):
         if self.player:
@@ -230,25 +247,20 @@ class VideoSearchApp(tk.Tk):
     def seek_to(self, seconds: float):
         if not self.video_path:
             return
-        # VLC millisekund
-        ms = int(max(0, seconds) * 1000)
+
+        # ✅ tanlangan vaqtni saqlab qo‘yamiz (Play bosilganda shu joydan davom etadi)
+        self.last_seek_sec = float(seconds)
+
+        ms = int(max(0, float(seconds)) * 1000)
         self.player.play()
         time.sleep(0.05)
         self.player.set_time(ms)
-
-    def seek_manual(self):
-        try:
-            sec = float(self.seek_entry.get().strip())
-            self.seek_to(sec)
-        except:
-            messagebox.showerror("Xato", "Sekundni to‘g‘ri kiriting. Masalan: 12.5")
 
     # ---------- subtitle yaratish ----------
     def make_subtitles_thread(self):
         if not self.video_path:
             messagebox.showwarning("Xabar", "Avval video yuklang.")
             return
-
         t = threading.Thread(target=self.make_subtitles, daemon=True)
         t.start()
 
@@ -259,7 +271,6 @@ class VideoSearchApp(tk.Tk):
 
             self._set_status("Holat: transkripsiya (subtitle) qilinmoqda...")
             model_name = self.model_var.get().strip()
-            # CPU uchun: compute_type="int8" tezroq, yengilroq
             model = WhisperModel(model_name, device="cpu", compute_type="int8")
 
             lang = self.lang_var.get().strip().lower()
@@ -297,7 +308,6 @@ class VideoSearchApp(tk.Tk):
             messagebox.showerror("SRT o‘qish xatosi", str(e))
             return
 
-        # Segmentlarni text oynaga chiqarish
         def fill():
             self.segments_text.delete("1.0", tk.END)
             for (st, en, txt) in self.srt_items:
@@ -319,9 +329,8 @@ class VideoSearchApp(tk.Tk):
         mode = self.match_mode.get()
         matches = []
 
-        for idx, (st, en, txt) in enumerate(self.srt_items):
+        for (st, en, txt) in self.srt_items:
             tnorm = normalize_text(txt)
-            ok = False
             if mode == "exact":
                 ok = (tnorm == q)
             else:
@@ -334,13 +343,17 @@ class VideoSearchApp(tk.Tk):
 
         if not matches:
             self.results_list.insert(tk.END, "Hech narsa topilmadi.")
+            self._last_matches = []
             return
 
         for (st, en, txt) in matches:
             self.results_list.insert(tk.END, f"{sec_to_hhmmss(st)}  |  {txt}")
 
-        # natijalar ro‘yxatini keyingi bosishda ham ishlatish uchun saqlab qo‘yamiz
         self._last_matches = matches
+
+        # ✅ Qidiruvdan keyin avtomatik "birinchi topilgan" joyni tanlab qo‘yamiz
+        # Shunda Play bosilganda avtomatik o'sha joydan ketadi.
+        self.last_seek_sec = float(matches[0][0])
 
     def on_select_result(self, event=None):
         if not hasattr(self, "_last_matches"):
